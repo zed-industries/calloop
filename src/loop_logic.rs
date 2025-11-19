@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +54,7 @@ pub(crate) struct LoopInner<'l, Data> {
     // while in-flight events might still refer to a recently destroyed event source.
     pub(crate) sources: RefCell<SourceList<'l, Data>>,
     pub(crate) sources_with_additional_lifecycle_events: RefCell<AdditionalLifecycleEventsSet>,
-    idles: RefCell<Vec<IdleCallback<'l, Data>>>,
+    idles: RefCell<VecDeque<IdleCallback<'l, Data>>>,
     pending_action: Cell<PostAction>,
 }
 
@@ -164,7 +165,7 @@ impl<'l, Data> LoopHandle<'l, Data> {
                 cb(data);
             }
         })));
-        self.inner.idles.borrow_mut().push(callback.clone());
+        self.inner.idles.borrow_mut().push_back(callback.clone());
         Idle { callback }
     }
 
@@ -412,7 +413,7 @@ impl<'l, Data> EventLoop<'l, Data> {
             inner: Rc::new(LoopInner {
                 poll: RefCell::new(poll),
                 sources: RefCell::new(SourceList::new()),
-                idles: RefCell::new(Vec::new()),
+                idles: RefCell::new(VecDeque::new()),
                 pending_action: Cell::new(PostAction::Continue),
                 sources_with_additional_lifecycle_events: Default::default(),
             }),
@@ -610,8 +611,16 @@ impl<'l, Data> EventLoop<'l, Data> {
     }
 
     fn dispatch_idles(&mut self, data: &mut Data) {
-        let idles = std::mem::take(&mut *self.handle.inner.idles.borrow_mut());
-        for idle in idles {
+        let mut idles = self.handle.inner.idles.borrow_mut();
+        let now = Instant::now();
+
+        // make sure to check events every 10ms
+        // let mut idles_dispatched = 0;
+        while now.elapsed().as_millis() < 10 {
+            let Some(idle) = idles.pop_front() else {
+                return;
+            };
+
             idle.borrow_mut().dispatch(data);
         }
     }
