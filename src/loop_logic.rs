@@ -28,6 +28,9 @@ use crate::{
 
 type IdleCallback<'i, Data> = Rc<RefCell<dyn IdleDispatcher<Data> + 'i>>;
 
+/// How long one dispatch may spend running idle callbacks before checking event sources again.
+const IDLE_DISPATCH_BUDGET: Duration = Duration::from_millis(10);
+
 /// A token representing a registration in the [`EventLoop`].
 ///
 /// This token is given to you by the [`EventLoop`] when an [`EventSource`] is inserted or
@@ -442,6 +445,11 @@ impl<'l, Data> EventLoop<'l, Data> {
         data: &mut Data,
     ) -> crate::Result<()> {
         let now = Instant::now();
+        // `dispatch_idles` stops after its time budget, so idle callbacks can still be queued.
+        // Poll without blocking so that they resume right after any ready events are handled.
+        if !self.handle.inner.idles.borrow().is_empty() {
+            timeout = Some(Duration::ZERO);
+        }
         {
             let mut extra_lifecycle_sources = self
                 .handle
@@ -610,17 +618,16 @@ impl<'l, Data> EventLoop<'l, Data> {
         Ok(())
     }
 
+    /// Runs queued idle callbacks for up to [`IDLE_DISPATCH_BUDGET`], so that event sources are
+    /// checked regularly while many callbacks are queued. Callbacks left over run on the next
+    /// dispatch, which doesn't block while any are queued.
     fn dispatch_idles(&mut self, data: &mut Data) {
-        let mut idles = self.handle.inner.idles.borrow_mut();
-        let now = Instant::now();
-
-        // make sure to check events every 10ms
-        // let mut idles_dispatched = 0;
-        while now.elapsed().as_millis() < 10 {
-            let Some(idle) = idles.pop_front() else {
+        let start = Instant::now();
+        while start.elapsed() < IDLE_DISPATCH_BUDGET {
+            // Not borrowed while the callback runs, since it may insert idle callbacks.
+            let Some(idle) = self.handle.inner.idles.borrow_mut().pop_front() else {
                 return;
             };
-
             idle.borrow_mut().dispatch(data);
         }
     }
@@ -631,8 +638,12 @@ impl<'l, Data> EventLoop<'l, Data> {
     /// Otherwise, this will wait until an event is received or the provided `timeout`
     /// is reached. If `timeout` is `None`, it will wait without a duration limit.
     ///
-    /// Once pending events have been processed or the timeout is reached, all pending
-    /// idle callbacks will be fired before this method returns.
+    /// If idle callbacks are queued, this doesn't wait: it only processes events that are
+    /// already pending.
+    ///
+    /// Once pending events have been processed or the timeout is reached, pending idle
+    /// callbacks are fired for up to 10 ms before this method returns. Any left over are fired
+    /// by the next dispatch.
     pub fn dispatch<D: Into<Option<Duration>>>(
         &mut self,
         timeout: D,
@@ -890,6 +901,45 @@ mod tests {
             .unwrap();
 
         assert!(dispatched);
+    }
+
+    #[test]
+    fn idles_left_over_after_the_budget_run_without_waiting() {
+        let mut event_loop: EventLoop<'_, usize> = EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        for _ in 0..30 {
+            handle.insert_idle(|dispatched| {
+                std::thread::sleep(Duration::from_millis(1));
+                *dispatched += 1;
+            });
+        }
+
+        // Nothing wakes the loop, so each dispatch would block forever if it waited for events.
+        let mut dispatched = 0;
+        let mut dispatches = 0;
+        while dispatched < 30 {
+            event_loop.dispatch(None, &mut dispatched).unwrap();
+            dispatches += 1;
+        }
+        assert!(dispatches > 1, "the budget should split the callbacks across dispatches");
+    }
+
+    #[test]
+    fn idle_can_insert_idle() {
+        let mut event_loop: EventLoop<'_, Vec<u32>> = EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        handle.insert_idle({
+            let handle = handle.clone();
+            move |order| {
+                order.push(1);
+                handle.insert_idle(|order| order.push(2));
+            }
+        });
+
+        let mut order = Vec::new();
+        event_loop.dispatch(Duration::ZERO, &mut order).unwrap();
+        event_loop.dispatch(Duration::ZERO, &mut order).unwrap();
+        assert_eq!(order, [1, 2]);
     }
 
     #[test]
